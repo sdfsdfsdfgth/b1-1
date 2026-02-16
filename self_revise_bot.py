@@ -62,6 +62,16 @@ MAX_TOTAL_PAGE_FETCHES = 18
 MAX_PAGES_PER_QUERY = 5
 REQUEST_DELAY_SECS = 0.2
 FRESHNESS_MAX_AGE_YEARS = 3
+OLLAMA_TIMEOUT_SECS = 300
+OLLAMA_MAX_RETRIES = 3
+OLLAMA_NUM_PREDICT = 600
+MAX_CANDIDATE_FOR_CRITIC = 6000
+SELF_IMPROVEMENT_ENABLED = True
+SELF_IMPROVEMENT_MAX_SOURCE_CHARS = 14000
+SELF_IMPROVEMENT_REPORT_PATH = Path("self_improvement_report.json")
+SELF_IMPROVEMENT_SUGGESTIONS_PATH = Path("self_improvement_suggestions.md")
+SELF_REWRITE_REPORT_PATH = Path("self_rewrite_report.json")
+SELF_REWRITE_BACKUP_PATH = Path("self_revise_bot.py.bak")
 
 AUTHORITATIVE_DOMAINS = {
     ".gov",
@@ -217,20 +227,29 @@ def save_knowledge_store(payload: Dict[str, Any]) -> None:
 def call_ollama(model: str, prompt: str, temperature: float) -> str:
     payload = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "prompt": prompt,
         "stream": False,
-        "options": {"temperature": temperature},
+        "options": {
+            "temperature": temperature,
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
     }
 
-    resp = requests.post(
-        "http://localhost:11434/api/chat",
-        json=payload,
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
+    for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                OLLAMA_URL,
+                json=payload,
+                timeout=OLLAMA_TIMEOUT_SECS,
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+        except requests.exceptions.ReadTimeout:
+            if attempt == OLLAMA_MAX_RETRIES:
+                raise
+            time.sleep(2 * attempt)
+
+    return ""
 
 
 # =========================
@@ -1495,6 +1514,230 @@ Now output the corrected JSON only.
 """.strip()
 
 
+
+
+def current_capabilities() -> List[str]:
+    return [
+        "Iterative generate→validate→critic→rewrite loop with max-iteration guard",
+        "Schema and rule-based deterministic validation with source-aware checks",
+        "Optional web research pipeline with caching and authority/recency scoring",
+        "Ollama /api/generate integration with retries, timeout, and token caps",
+        "Rewrite drift guard that limits excessive edits",
+        "AI brainstorming that outputs self-improvement ideas and rewrite snippets",
+    ]
+
+
+def prompt_requested_features() -> List[str]:
+    print("\n✨ Current capabilities:")
+    for idx, item in enumerate(current_capabilities(), start=1):
+        print(f"  {idx}. {item}")
+
+    print("\nWhat features should I add to my own code?")
+    print("- Enter one feature per line. Press Enter on an empty line to finish.")
+
+    requested: List[str] = []
+    while True:
+        try:
+            line = input("feature> ").strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        requested.append(line)
+    return requested
+
+
+def self_rewrite_prompt(
+    source_code: str,
+    requested_features: List[str],
+    recent_result: Dict[str, Any],
+) -> str:
+    run_summary = {
+        "status": recent_result.get("status"),
+        "iterations": recent_result.get("iterations"),
+        "last_violations": recent_result.get("last_violations", [])[:5],
+    }
+    return f"""
+SYSTEM:
+You are rewriting this Python file to implement requested new features.
+
+GOAL:
+- Return the COMPLETE updated Python file as plain text.
+- Keep existing behavior unless a requested feature requires changes.
+- Preserve deterministic validation behavior and Ollama request handling.
+
+REQUESTED FEATURES:
+{json.dumps(requested_features, ensure_ascii=False, indent=2)}
+
+CURRENT CAPABILITIES:
+{json.dumps(current_capabilities(), ensure_ascii=False, indent=2)}
+
+RECENT RUN SUMMARY:
+{json.dumps(run_summary, ensure_ascii=False, indent=2)}
+
+OUTPUT RULES:
+- Return only Python source code for the full file.
+- No markdown fences. No commentary.
+- Ensure syntax is valid Python.
+
+CURRENT SOURCE:
+{source_code}
+""".strip()
+
+
+def _extract_python_source(raw: str) -> str:
+    fenced = re.search(r"```(?:python)?\s*(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+    return raw.strip()
+
+
+def _validate_python_source(source_text: str, filename: str) -> Tuple[bool, str]:
+    try:
+        compile(source_text, filename, "exec")
+        return True, ""
+    except SyntaxError as e:
+        return False, f"{e.msg} (line {e.lineno})"
+
+
+def self_rewrite_code(
+    requested_features: List[str],
+    recent_result: Dict[str, Any],
+    source_path: Path = Path(__file__),
+) -> Dict[str, Any]:
+    if not requested_features:
+        return {"applied": False, "reason": "No requested features provided."}
+
+    source = source_path.read_text(encoding="utf-8")
+    prompt = self_rewrite_prompt(source, requested_features, recent_result)
+
+    raw = call_ollama(REWRITE_MODEL, prompt, temperature=0.2)
+    rewritten_source = _extract_python_source(raw)
+    valid, error = _validate_python_source(rewritten_source, str(source_path))
+
+    report: Dict[str, Any] = {
+        "model": REWRITE_MODEL,
+        "requested_features": requested_features,
+        "valid_python": valid,
+        "syntax_error": error,
+        "applied": False,
+    }
+
+    if valid and rewritten_source and rewritten_source != source:
+        SELF_REWRITE_BACKUP_PATH.write_text(source, encoding="utf-8")
+        source_path.write_text(rewritten_source, encoding="utf-8")
+        report["applied"] = True
+        report["backup_path"] = str(SELF_REWRITE_BACKUP_PATH)
+    elif rewritten_source == source:
+        report["reason"] = "Model returned source identical to current file."
+    else:
+        report["reason"] = "Generated source was invalid Python and was not applied."
+
+    SELF_REWRITE_REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
+def self_improvement_prompt(source_code: str, recent_result: Dict[str, Any]) -> str:
+    summary = {
+        "status": recent_result.get("status"),
+        "iterations": recent_result.get("iterations"),
+        "violations": recent_result.get("last_violations", [])[:5],
+    }
+    return f"""
+SYSTEM:
+You are a senior Python reviewer helping this script improve itself.
+
+TASK:
+1) Brainstorm practical improvements to reliability, speed, and output quality.
+2) Propose concrete code rewrites for the highest-impact parts.
+
+OUTPUT CONTRACT:
+Return ONE JSON object only with this schema:
+{{
+  "brainstorm": ["short idea", "..."],
+  "rewrites": [
+    {{
+      "target": "function or section name",
+      "rationale": "why this rewrite helps",
+      "replacement": "improved Python snippet"
+    }}
+  ],
+  "quick_wins": ["small immediate change", "..."]
+}}
+
+CONSTRAINTS:
+- Keep brainstorm items concise and actionable.
+- Rewrites must be valid Python snippets, not pseudocode.
+- Focus on minimal, high-value changes.
+
+RECENT RUN SUMMARY:
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+
+CURRENT SOURCE (possibly truncated):
+{source_code}
+""".strip()
+
+
+def brainstorm_self_improvements(
+    recent_result: Dict[str, Any],
+    source_path: Path = Path(__file__),
+) -> Dict[str, Any]:
+    source = source_path.read_text(encoding="utf-8")
+    truncated_source = source[:SELF_IMPROVEMENT_MAX_SOURCE_CHARS]
+    prompt = self_improvement_prompt(truncated_source, recent_result)
+
+    raw = call_ollama(REWRITE_MODEL, prompt, temperature=0.2)
+    try:
+        parsed = extract_json_object(raw)
+    except Exception:
+        parsed = {
+            "brainstorm": [],
+            "rewrites": [],
+            "quick_wins": [],
+            "raw": raw,
+        }
+
+    report = {
+        "model": REWRITE_MODEL,
+        "source_path": str(source_path),
+        "source_truncated": len(source) > len(truncated_source),
+        "result": parsed,
+    }
+    SELF_IMPROVEMENT_REPORT_PATH.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    brainstorm_lines = ["# Self-improvement suggestions", ""]
+    for item in parsed.get("brainstorm", []):
+        brainstorm_lines.append(f"- {item}")
+    if parsed.get("quick_wins"):
+        brainstorm_lines.extend(["", "## Quick wins"])
+        for item in parsed.get("quick_wins", []):
+            brainstorm_lines.append(f"- {item}")
+    if parsed.get("rewrites"):
+        brainstorm_lines.extend(["", "## Proposed rewrites"])
+        for rw in parsed.get("rewrites", []):
+            target = rw.get("target", "unknown")
+            rationale = rw.get("rationale", "")
+            replacement = rw.get("replacement", "")
+            brainstorm_lines.extend(
+                [
+                    f"### {target}",
+                    rationale,
+                    "```python",
+                    replacement,
+                    "```",
+                    "",
+                ]
+            )
+    SELF_IMPROVEMENT_SUGGESTIONS_PATH.write_text(
+        "\n".join(brainstorm_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
 # =========================
 # ORCHESTRATOR
 # =========================
@@ -1590,10 +1833,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
 
         # 2) Critique
         print(f"   → Found {len(violations)} violations. Critiquing...")
+        if len(candidate) > MAX_CANDIDATE_FOR_CRITIC:
+            candidate_for_critic = candidate[:MAX_CANDIDATE_FOR_CRITIC] + "\n...[TRUNCATED]..."
+        else:
+            candidate_for_critic = candidate
+
         try:
             critic_out = call_ollama(
                 CRITIC_MODEL,
-                critic_prompt(task, guideline, candidate, violations, research_notes=research_notes),
+                critic_prompt(task, guideline, candidate_for_critic, violations, research_notes=research_notes),
                 temperature=CRITIC_TEMP,
             )
         except KeyboardInterrupt:
@@ -1699,3 +1947,19 @@ SR-01 Prefer short bullet items.
         if result.get("final_text"):
             print(result["final_text"])
         print(f"\nLog written to: {result['log_path']}")
+
+        if SELF_IMPROVEMENT_ENABLED and result["status"] != "INTERRUPTED":
+            print("\n🧠 Brainstorming AI-driven self-improvements...")
+            improvement_report = brainstorm_self_improvements(result)
+            ideas = improvement_report.get("result", {}).get("brainstorm", [])
+            print(f"✅ Saved {len(ideas)} brainstorm ideas to {SELF_IMPROVEMENT_REPORT_PATH}")
+            print(f"✅ Saved rewrite suggestions to {SELF_IMPROVEMENT_SUGGESTIONS_PATH}")
+
+            requested_features = prompt_requested_features()
+            rewrite_report = self_rewrite_code(requested_features, result)
+            if rewrite_report.get("applied"):
+                print("✅ Applied AI self-rewrite to source code.")
+                print(f"✅ Backup written to {rewrite_report.get('backup_path')}")
+            else:
+                print(f"⚠️ Self-rewrite not applied: {rewrite_report.get('reason', 'unknown reason')}")
+            print(f"ℹ️ Rewrite report: {SELF_REWRITE_REPORT_PATH}")
