@@ -66,6 +66,10 @@ OLLAMA_TIMEOUT_SECS = 300
 OLLAMA_MAX_RETRIES = 3
 OLLAMA_NUM_PREDICT = 600
 MAX_CANDIDATE_FOR_CRITIC = 6000
+SELF_IMPROVEMENT_ENABLED = True
+SELF_IMPROVEMENT_MAX_SOURCE_CHARS = 14000
+SELF_IMPROVEMENT_REPORT_PATH = Path("self_improvement_report.json")
+SELF_IMPROVEMENT_SUGGESTIONS_PATH = Path("self_improvement_suggestions.md")
 
 AUTHORITATIVE_DOMAINS = {
     ".gov",
@@ -1508,6 +1512,109 @@ Now output the corrected JSON only.
 """.strip()
 
 
+
+
+def self_improvement_prompt(source_code: str, recent_result: Dict[str, Any]) -> str:
+    summary = {
+        "status": recent_result.get("status"),
+        "iterations": recent_result.get("iterations"),
+        "violations": recent_result.get("last_violations", [])[:5],
+    }
+    return f"""
+SYSTEM:
+You are a senior Python reviewer helping this script improve itself.
+
+TASK:
+1) Brainstorm practical improvements to reliability, speed, and output quality.
+2) Propose concrete code rewrites for the highest-impact parts.
+
+OUTPUT CONTRACT:
+Return ONE JSON object only with this schema:
+{{
+  "brainstorm": ["short idea", "..."],
+  "rewrites": [
+    {{
+      "target": "function or section name",
+      "rationale": "why this rewrite helps",
+      "replacement": "improved Python snippet"
+    }}
+  ],
+  "quick_wins": ["small immediate change", "..."]
+}}
+
+CONSTRAINTS:
+- Keep brainstorm items concise and actionable.
+- Rewrites must be valid Python snippets, not pseudocode.
+- Focus on minimal, high-value changes.
+
+RECENT RUN SUMMARY:
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+
+CURRENT SOURCE (possibly truncated):
+{source_code}
+""".strip()
+
+
+def brainstorm_self_improvements(
+    recent_result: Dict[str, Any],
+    source_path: Path = Path(__file__),
+) -> Dict[str, Any]:
+    source = source_path.read_text(encoding="utf-8")
+    truncated_source = source[:SELF_IMPROVEMENT_MAX_SOURCE_CHARS]
+    prompt = self_improvement_prompt(truncated_source, recent_result)
+
+    raw = call_ollama(REWRITE_MODEL, prompt, temperature=0.2)
+    try:
+        parsed = extract_json_object(raw)
+    except Exception:
+        parsed = {
+            "brainstorm": [],
+            "rewrites": [],
+            "quick_wins": [],
+            "raw": raw,
+        }
+
+    report = {
+        "model": REWRITE_MODEL,
+        "source_path": str(source_path),
+        "source_truncated": len(source) > len(truncated_source),
+        "result": parsed,
+    }
+    SELF_IMPROVEMENT_REPORT_PATH.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    brainstorm_lines = ["# Self-improvement suggestions", ""]
+    for item in parsed.get("brainstorm", []):
+        brainstorm_lines.append(f"- {item}")
+    if parsed.get("quick_wins"):
+        brainstorm_lines.extend(["", "## Quick wins"])
+        for item in parsed.get("quick_wins", []):
+            brainstorm_lines.append(f"- {item}")
+    if parsed.get("rewrites"):
+        brainstorm_lines.extend(["", "## Proposed rewrites"])
+        for rw in parsed.get("rewrites", []):
+            target = rw.get("target", "unknown")
+            rationale = rw.get("rationale", "")
+            replacement = rw.get("replacement", "")
+            brainstorm_lines.extend(
+                [
+                    f"### {target}",
+                    rationale,
+                    "```python",
+                    replacement,
+                    "```",
+                    "",
+                ]
+            )
+    SELF_IMPROVEMENT_SUGGESTIONS_PATH.write_text(
+        "\n".join(brainstorm_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
 # =========================
 # ORCHESTRATOR
 # =========================
@@ -1717,3 +1824,10 @@ SR-01 Prefer short bullet items.
         if result.get("final_text"):
             print(result["final_text"])
         print(f"\nLog written to: {result['log_path']}")
+
+        if SELF_IMPROVEMENT_ENABLED and result["status"] != "INTERRUPTED":
+            print("\n🧠 Brainstorming AI-driven self-improvements...")
+            improvement_report = brainstorm_self_improvements(result)
+            ideas = improvement_report.get("result", {}).get("brainstorm", [])
+            print(f"✅ Saved {len(ideas)} brainstorm ideas to {SELF_IMPROVEMENT_REPORT_PATH}")
+            print(f"✅ Saved rewrite suggestions to {SELF_IMPROVEMENT_SUGGESTIONS_PATH}")
