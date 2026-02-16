@@ -1,8 +1,10 @@
 import json
 import re
 import time
+from html import unescape
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import requests
 from jsonschema import ValidationError, validate
@@ -14,6 +16,7 @@ from rapidfuzz.distance import Levenshtein
 # =========================
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+USER_AGENT = "self-revise-bot/1.0 (+https://example.local)"
 
 GEN_MODEL = "llama3.1:8b"
 CRITIC_MODEL = "qwen2.5:7b"
@@ -32,6 +35,28 @@ MAX_OUTPUT_CHARS = 2000
 FORBIDDEN_PATTERNS = [
     r"\bas an ai\b",
     r"\bi think\b",
+]
+
+MAX_SEARCH_RESULTS = 5
+MAX_RESEARCH_SOURCES = 4
+MAX_SNIPPET_CHARS = 900
+RESEARCH_TIMEOUT_SECS = 20
+
+RESEARCH_KEYWORDS = [
+    "latest",
+    "current",
+    "today",
+    "price",
+    "law",
+    "regulation",
+    "event",
+    "date",
+    "news",
+    "source",
+    "evidence",
+    "research",
+    "statistics",
+    "up-to-date",
 ]
 
 # Output contract: JSON with exact keys (adjust to your needs)
@@ -61,6 +86,13 @@ class Violation:
     location: str
 
 
+@dataclass
+class ResearchSource:
+    url: str
+    title: str
+    snippet: str
+
+
 # =========================
 # LLM CLIENT (OLLAMA)
 # =========================
@@ -76,6 +108,99 @@ def call_ollama(model: str, prompt: str, temperature: float) -> str:
     resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json()["response"]
+
+
+def needs_research(task: str, guideline: str) -> bool:
+    text = f"{task}\n{guideline}".lower()
+    return any(k in text for k in RESEARCH_KEYWORDS)
+
+
+def web_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> List[Tuple[str, str]]:
+    """
+    Uses DuckDuckGo's HTML endpoint and extracts (title, url) pairs.
+    """
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    headers = {"User-Agent": USER_AGENT}
+    resp = requests.get(url, headers=headers, timeout=RESEARCH_TIMEOUT_SECS)
+    resp.raise_for_status()
+    html = resp.text
+
+    matches = re.findall(
+        r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    results: List[Tuple[str, str]] = []
+    for raw_href, raw_title in matches:
+        clean_title = re.sub(r"<[^>]+>", "", raw_title)
+        clean_title = unescape(clean_title).strip()
+        href = unescape(raw_href)
+        if not href.startswith("http"):
+            continue
+        results.append((clean_title, href))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def fetch_page_snippet(url: str, max_chars: int = MAX_SNIPPET_CHARS) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    resp = requests.get(url, headers=headers, timeout=RESEARCH_TIMEOUT_SECS)
+    resp.raise_for_status()
+    body = resp.text
+
+    # lightweight tag stripping to avoid additional dependencies
+    text = re.sub(r"<script[\\s\\S]*?</script>", " ", body, flags=re.IGNORECASE)
+    text = re.sub(r"<style[\\s\\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def research_web(task: str, guideline: str) -> List[ResearchSource]:
+    """
+    Collects concise, source-linked context that can be injected into prompts.
+    """
+    queries = [task]
+    if len(task.split()) > 4:
+        queries.append(f"{task} official source")
+
+    gathered: List[ResearchSource] = []
+    seen_urls = set()
+
+    for query in queries:
+        try:
+            search_hits = web_search(query)
+        except Exception:
+            continue
+
+        for title, url in search_hits:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                snippet = fetch_page_snippet(url)
+            except Exception:
+                continue
+            if not snippet:
+                continue
+            gathered.append(ResearchSource(url=url, title=title or url, snippet=snippet))
+            if len(gathered) >= MAX_RESEARCH_SOURCES:
+                return gathered
+
+    return gathered
+
+
+def format_research_context(sources: List[ResearchSource]) -> str:
+    if not sources:
+        return "No reliable web sources retrieved."
+
+    lines = []
+    for i, source in enumerate(sources, 1):
+        lines.append(f"[{i}] {source.title}\nURL: {source.url}\nSnippet: {source.snippet}")
+    return "\n\n".join(lines)
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -132,10 +257,15 @@ def hard_validate(raw_text: str) -> Tuple[bool, List[Violation], Optional[Dict[s
 # =========================
 
 
-def generator_prompt(task: str, guideline: str) -> str:
+def generator_prompt(task: str, guideline: str, research_context: str = "") -> str:
     return f"""
 SYSTEM:
 You are the GENERATOR. Produce the final answer for the task.
+
+RESEARCH AND FACTUALITY REQUIREMENTS:
+- If web research context is provided below, use it for factual grounding.
+- Do not invent facts that are not supported by task context or research context.
+- If the task requires external facts and context is missing, keep claims conservative and non-specific.
 
 NON-NEGOTIABLE OUTPUT CONTRACT:
 - Output MUST be a single JSON object and NOTHING ELSE.
@@ -149,6 +279,9 @@ HARD RULES (MUST PASS):
 
 TASK:
 {task}
+
+WEB RESEARCH CONTEXT (if any):
+{research_context}
 
 INTERNAL SELF-CHECK BEFORE YOU OUTPUT:
 1) Is the output valid JSON? (parseable)
@@ -260,8 +393,25 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
+    research_sources: List[ResearchSource] = []
+    if needs_research(task, guideline):
+        research_sources = research_web(task, guideline)
+        log(
+            {
+                "phase": "research",
+                "required": True,
+                "sources": [s.__dict__ for s in research_sources],
+            }
+        )
+
+    research_context = format_research_context(research_sources)
+
     # 1) Generate
-    candidate = call_ollama(GEN_MODEL, generator_prompt(task, guideline), temperature=GEN_TEMP)
+    candidate = call_ollama(
+        GEN_MODEL,
+        generator_prompt(task, guideline, research_context=research_context),
+        temperature=GEN_TEMP,
+    )
     log({"phase": "generate", "model": GEN_MODEL, "text": candidate})
 
     last_violations: List[Violation] = []
