@@ -1308,6 +1308,18 @@ Now output the corrected JSON only.
 # =========================
 
 
+def interrupted_result(reason: str, log_path: str) -> Dict[str, Any]:
+    return {
+        "status": "INTERRUPTED",
+        "iterations": 0,
+        "final_text": "",
+        "final_json": None,
+        "last_violations": [],
+        "reason": reason,
+        "log_path": log_path,
+    }
+
+
 def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> Dict[str, Any]:
     """
     Returns dict with final_text, status, iterations, last_violations, and final_json (if parseable).
@@ -1324,23 +1336,32 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
 
     # 1) Research phase (pre-generation)
     if needs_research(task, guideline):
-        research = research_web(task, guideline)
+        try:
+            research = research_web(task, guideline)
+        except KeyboardInterrupt:
+            log({"phase": "interrupted", "stage": "research"})
+            return interrupted_result("Interrupted during research phase.", log_path)
+
         research_context = research.get("context", "No reliable web sources retrieved.")
         research_notes = build_structured_research_notes(research)
         log({"phase": "research", **research})
         log({"phase": "research_notes", "notes": research_notes})
 
     # 2) Generate
-    candidate = call_ollama(
-        GEN_MODEL,
-        generator_prompt(
-            task,
-            guideline,
-            research_context=research_context,
-            research_notes=research_notes,
-        ),
-        temperature=GEN_TEMP,
-    )
+    try:
+        candidate = call_ollama(
+            GEN_MODEL,
+            generator_prompt(
+                task,
+                guideline,
+                research_context=research_context,
+                research_notes=research_notes,
+            ),
+            temperature=GEN_TEMP,
+        )
+    except KeyboardInterrupt:
+        log({"phase": "interrupted", "stage": "generate"})
+        return interrupted_result("Interrupted during generation phase.", log_path)
     log({"phase": "generate", "model": GEN_MODEL, "text": candidate})
 
     last_violations: List[Violation] = []
@@ -1368,11 +1389,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
             }
 
         # 2) Critique
-        critic_out = call_ollama(
-            CRITIC_MODEL,
-            critic_prompt(task, guideline, candidate, violations, research_notes=research_notes),
-            temperature=CRITIC_TEMP,
-        )
+        try:
+            critic_out = call_ollama(
+                CRITIC_MODEL,
+                critic_prompt(task, guideline, candidate, violations, research_notes=research_notes),
+                temperature=CRITIC_TEMP,
+            )
+        except KeyboardInterrupt:
+            log({"phase": "interrupted", "stage": "critic", "iter": i})
+            return interrupted_result("Interrupted during critic phase.", log_path)
         log({"phase": "critic_raw", "iter": i, "model": CRITIC_MODEL, "text": critic_out})
 
         try:
@@ -1395,11 +1420,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         log({"phase": "critic_json", "iter": i, "defects": defects})
 
         # 3) Rewrite
-        rewritten = call_ollama(
-            REWRITE_MODEL,
-            rewriter_prompt(guideline, candidate, defects),
-            temperature=REWRITE_TEMP,
-        )
+        try:
+            rewritten = call_ollama(
+                REWRITE_MODEL,
+                rewriter_prompt(guideline, candidate, defects),
+                temperature=REWRITE_TEMP,
+            )
+        except KeyboardInterrupt:
+            log({"phase": "interrupted", "stage": "rewrite", "iter": i})
+            return interrupted_result("Interrupted during rewrite phase.", log_path)
         log({"phase": "rewrite", "iter": i, "model": REWRITE_MODEL, "text": rewritten})
 
         # Optional drift guard: if rewrite changed too much, clamp scope to hard violations only
@@ -1408,11 +1437,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
                 "violations_hard": defects.get("violations_hard", []),
                 "violations_soft": [],
             }
-            rewritten2 = call_ollama(
-                REWRITE_MODEL,
-                rewriter_prompt(guideline, candidate, defects_hard_only),
-                temperature=0.1,
-            )
+            try:
+                rewritten2 = call_ollama(
+                    REWRITE_MODEL,
+                    rewriter_prompt(guideline, candidate, defects_hard_only),
+                    temperature=0.1,
+                )
+            except KeyboardInterrupt:
+                log({"phase": "interrupted", "stage": "rewrite_drift_guard", "iter": i})
+                return interrupted_result("Interrupted during rewrite drift guard phase.", log_path)
             log({"phase": "rewrite_drift_guard", "iter": i, "text": rewritten2})
             rewritten = rewritten2
 
@@ -1446,10 +1479,18 @@ SR-01 Prefer short bullet items.
 
     TASK = "Explain Newton's 2nd law and give one numeric example."
 
-    result = self_revise(TASK, GUIDELINE)
-    print("STATUS:", result["status"])
-    print("ITERATIONS:", result["iterations"])
-    if result["status"] != "PASS":
-        print("LAST VIOLATIONS:", json.dumps(result["last_violations"], indent=2))
-    print(result["final_text"])
-    print(f"\nLog written to: {result['log_path']}")
+    try:
+        result = self_revise(TASK, GUIDELINE)
+    except KeyboardInterrupt:
+        print("STATUS: INTERRUPTED")
+        print("Run interrupted by user.")
+    else:
+        print("STATUS:", result["status"])
+        print("ITERATIONS:", result["iterations"])
+        if result["status"] not in {"PASS", "INTERRUPTED"}:
+            print("LAST VIOLATIONS:", json.dumps(result["last_violations"], indent=2))
+        if result.get("reason"):
+            print("REASON:", result["reason"])
+        if result.get("final_text"):
+            print(result["final_text"])
+        print(f"\nLog written to: {result['log_path']}")
