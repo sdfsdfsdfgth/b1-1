@@ -52,6 +52,7 @@ MAX_FACTS = 12
 MIN_MULTI_SOURCE_CONFIRMATIONS = 2
 MAX_RESEARCH_QUERIES = 5
 RESEARCH_CACHE_PATH = Path(".research_cache.json")
+MIN_CLAIM_TOKEN_OVERLAP = 0.45
 
 AUTHORITATIVE_DOMAINS = {
     ".gov",
@@ -129,6 +130,14 @@ class VerifiedFact:
     text: str
     source_urls: List[str]
     conflict: bool = False
+
+
+@dataclass
+class SourceAwareViolation:
+    rule_id: str
+    location: str
+    problem: str
+    fix: str
 
 
 # =========================
@@ -1025,12 +1034,142 @@ def hard_validate(raw_text: str) -> Tuple[bool, List[Violation], Optional[Dict[s
     return len(violations) == 0, violations, obj
 
 
+
+def build_structured_research_notes(research: Dict[str, Any]) -> Dict[str, Any]:
+    facts = research.get("verified_facts", [])
+    sources = research.get("sources", [])
+    return {
+        "required": bool(research.get("required", False)),
+        "queries": research.get("queries", []),
+        "fact_count": len(facts),
+        "source_count": len(sources),
+        "facts": [
+            {
+                "text": f.get("text", ""),
+                "source_urls": f.get("source_urls", []),
+                "conflict": bool(f.get("conflict", False)),
+            }
+            for f in facts
+        ],
+        "sources": [
+            {
+                "url": s.get("url", ""),
+                "title": s.get("title", ""),
+                "domain": s.get("domain", ""),
+                "score": s.get("score", 0),
+            }
+            for s in sources
+        ],
+    }
+
+
+def citations_required(task: str, guideline: str) -> bool:
+    return bool(re.search(r"\b(cite|citation|citations|required source|sources required)\b", f"{task}\n{guideline}", flags=re.IGNORECASE))
+
+
+def tokenize_claim(text: str) -> Set[str]:
+    tokens = re.findall(r"\b[a-z0-9]{3,}\b", text.lower())
+    stop = {"the", "and", "for", "with", "that", "this", "from", "into", "are", "was"}
+    return {t for t in tokens if t not in stop}
+
+
+def claim_support_score(claim: str, fact: str) -> float:
+    c = tokenize_claim(claim)
+    f = tokenize_claim(fact)
+    if not c or not f:
+        return 0.0
+    overlap = len(c & f)
+    return overlap / max(1, len(c))
+
+
+def extract_candidate_claims(parsed_obj: Dict[str, Any]) -> List[Tuple[str, str]]:
+    claims: List[Tuple[str, str]] = []
+    for key in ["givens", "unknown", "equations", "solve"]:
+        values = parsed_obj.get(key, [])
+        if isinstance(values, list):
+            for idx, value in enumerate(values):
+                if isinstance(value, str) and value.strip():
+                    claims.append((f"$.{key}[{idx}]", value.strip()))
+    solution = parsed_obj.get("solution", "")
+    if isinstance(solution, str):
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", solution) if s.strip()]
+        if not sentences and solution.strip():
+            sentences = [solution.strip()]
+        for idx, sentence in enumerate(sentences):
+            claims.append((f"$.solution[{idx}]", sentence))
+    return claims
+
+
+def source_aware_critic(parsed_obj: Optional[Dict[str, Any]], research_notes: Dict[str, Any], citation_is_required: bool) -> List[SourceAwareViolation]:
+    if not parsed_obj:
+        return []
+
+    facts = research_notes.get("facts", [])
+    fact_texts = [f.get("text", "") for f in facts if f.get("text")]
+
+    violations: List[SourceAwareViolation] = []
+    for location, claim in extract_candidate_claims(parsed_obj):
+        has_numeric_signal = bool(re.search(r"\b\d", claim))
+        likely_factual = has_numeric_signal or len(tokenize_claim(claim)) >= 6
+        if not likely_factual:
+            continue
+
+        best_score = max((claim_support_score(claim, ft) for ft in fact_texts), default=0.0)
+        if best_score < MIN_CLAIM_TOKEN_OVERLAP:
+            violations.append(
+                SourceAwareViolation(
+                    rule_id="RV-03",
+                    location=location,
+                    problem="Claim is not grounded in research notes; potential hallucinated data.",
+                    fix="Rewrite the claim using only verified facts from research notes, or remove it.",
+                )
+            )
+        elif citation_is_required and not facts:
+            violations.append(
+                SourceAwareViolation(
+                    rule_id="RV-02",
+                    location=location,
+                    problem="Citation/source support required but no verified sources were available.",
+                    fix="Only include claims that can be backed by sourced research notes.",
+                )
+            )
+
+    return violations
+
+
+def validate_with_research(
+    raw_text: str,
+    task: str,
+    guideline: str,
+    research_notes: Optional[Dict[str, Any]],
+) -> Tuple[bool, List[Violation], Optional[Dict[str, Any]]]:
+    ok, violations, parsed = hard_validate(raw_text)
+    if not parsed or not research_notes or not research_notes.get("required"):
+        return ok, violations, parsed
+
+    citation_is_required = citations_required(task, guideline)
+    source_violations = source_aware_critic(parsed, research_notes, citation_is_required)
+    violations.extend(
+        Violation(
+            rule_id=v.rule_id,
+            message=v.problem,
+            location=v.location,
+        )
+        for v in source_violations
+    )
+    return len(violations) == 0, violations, parsed
+
 # =========================
 # PROMPT BUILDERS
 # =========================
 
 
-def generator_prompt(task: str, guideline: str, research_context: str = "") -> str:
+def generator_prompt(
+    task: str,
+    guideline: str,
+    research_context: str = "",
+    research_notes: Optional[Dict[str, Any]] = None,
+) -> str:
     return f"""
 SYSTEM:
 You are the GENERATOR. Produce the final answer for the task.
@@ -1058,6 +1197,9 @@ TASK:
 WEB RESEARCH CONTEXT (if any):
 {research_context}
 
+STRUCTURED RESEARCH NOTES (JSON):
+{json.dumps(research_notes or {}, ensure_ascii=False, indent=2)}
+
 INTERNAL SELF-CHECK BEFORE YOU OUTPUT:
 1) Is the output valid JSON? (parseable)
 2) Does it contain ONLY the 5 keys? (no extras)
@@ -1073,6 +1215,7 @@ def critic_prompt(
     guideline: str,
     candidate: str,
     validator_violations: List[Violation],
+    research_notes: Optional[Dict[str, Any]] = None,
 ) -> str:
     v = [vi.__dict__ for vi in validator_violations]
     return f"""
@@ -1109,6 +1252,14 @@ CANDIDATE (may be invalid / may have extra text):
 
 DETERMINISTIC VALIDATOR VIOLATIONS (AUTHORITATIVE):
 {json.dumps(v, indent=2)}
+
+STRUCTURED RESEARCH NOTES (for source-aware checks):
+{json.dumps(research_notes or {}, ensure_ascii=False, indent=2)}
+
+SOURCE-AWARE CRITIC REQUIREMENTS:
+- Flag a hard violation when a factual claim cannot be tied to verified facts in research notes.
+- Flag a hard violation when citations are required but a claim lacks source support in research notes.
+- Flag hard violations for hallucinated numbers/dates not grounded in verified facts.
 
 Now output the JSON defect list only.
 """.strip()
@@ -1157,6 +1308,18 @@ Now output the corrected JSON only.
 # =========================
 
 
+def interrupted_result(reason: str, log_path: str) -> Dict[str, Any]:
+    return {
+        "status": "INTERRUPTED",
+        "iterations": 0,
+        "final_text": "",
+        "final_json": None,
+        "last_violations": [],
+        "reason": reason,
+        "log_path": log_path,
+    }
+
+
 def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> Dict[str, Any]:
     """
     Returns dict with final_text, status, iterations, last_violations, and final_json (if parseable).
@@ -1169,23 +1332,42 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
             f.write(json.dumps(event) + "\n")
 
     research_context = "No external research required."
-    if needs_research(task, guideline):
-        research = research_web(task, guideline)
-        research_context = research.get("context", "No reliable web sources retrieved.")
-        log({"phase": "research", **research})
+    research_notes: Dict[str, Any] = {"required": False, "facts": [], "sources": []}
 
-    # 1) Generate
-    candidate = call_ollama(
-        GEN_MODEL,
-        generator_prompt(task, guideline, research_context=research_context),
-        temperature=GEN_TEMP,
-    )
+    # 1) Research phase (pre-generation)
+    if needs_research(task, guideline):
+        try:
+            research = research_web(task, guideline)
+        except KeyboardInterrupt:
+            log({"phase": "interrupted", "stage": "research"})
+            return interrupted_result("Interrupted during research phase.", log_path)
+
+        research_context = research.get("context", "No reliable web sources retrieved.")
+        research_notes = build_structured_research_notes(research)
+        log({"phase": "research", **research})
+        log({"phase": "research_notes", "notes": research_notes})
+
+    # 2) Generate
+    try:
+        candidate = call_ollama(
+            GEN_MODEL,
+            generator_prompt(
+                task,
+                guideline,
+                research_context=research_context,
+                research_notes=research_notes,
+            ),
+            temperature=GEN_TEMP,
+        )
+    except KeyboardInterrupt:
+        log({"phase": "interrupted", "stage": "generate"})
+        return interrupted_result("Interrupted during generation phase.", log_path)
     log({"phase": "generate", "model": GEN_MODEL, "text": candidate})
 
     last_violations: List[Violation] = []
 
     for i in range(1, MAX_ITERS + 1):
-        ok, violations, parsed = hard_validate(candidate)
+        ok, violations, parsed = validate_with_research(candidate, task, guideline, research_notes)
         last_violations = violations
         log(
             {
@@ -1207,11 +1389,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
             }
 
         # 2) Critique
-        critic_out = call_ollama(
-            CRITIC_MODEL,
-            critic_prompt(task, guideline, candidate, violations),
-            temperature=CRITIC_TEMP,
-        )
+        try:
+            critic_out = call_ollama(
+                CRITIC_MODEL,
+                critic_prompt(task, guideline, candidate, violations, research_notes=research_notes),
+                temperature=CRITIC_TEMP,
+            )
+        except KeyboardInterrupt:
+            log({"phase": "interrupted", "stage": "critic", "iter": i})
+            return interrupted_result("Interrupted during critic phase.", log_path)
         log({"phase": "critic_raw", "iter": i, "model": CRITIC_MODEL, "text": critic_out})
 
         try:
@@ -1234,11 +1420,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         log({"phase": "critic_json", "iter": i, "defects": defects})
 
         # 3) Rewrite
-        rewritten = call_ollama(
-            REWRITE_MODEL,
-            rewriter_prompt(guideline, candidate, defects),
-            temperature=REWRITE_TEMP,
-        )
+        try:
+            rewritten = call_ollama(
+                REWRITE_MODEL,
+                rewriter_prompt(guideline, candidate, defects),
+                temperature=REWRITE_TEMP,
+            )
+        except KeyboardInterrupt:
+            log({"phase": "interrupted", "stage": "rewrite", "iter": i})
+            return interrupted_result("Interrupted during rewrite phase.", log_path)
         log({"phase": "rewrite", "iter": i, "model": REWRITE_MODEL, "text": rewritten})
 
         # Optional drift guard: if rewrite changed too much, clamp scope to hard violations only
@@ -1247,18 +1437,22 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
                 "violations_hard": defects.get("violations_hard", []),
                 "violations_soft": [],
             }
-            rewritten2 = call_ollama(
-                REWRITE_MODEL,
-                rewriter_prompt(guideline, candidate, defects_hard_only),
-                temperature=0.1,
-            )
+            try:
+                rewritten2 = call_ollama(
+                    REWRITE_MODEL,
+                    rewriter_prompt(guideline, candidate, defects_hard_only),
+                    temperature=0.1,
+                )
+            except KeyboardInterrupt:
+                log({"phase": "interrupted", "stage": "rewrite_drift_guard", "iter": i})
+                return interrupted_result("Interrupted during rewrite drift guard phase.", log_path)
             log({"phase": "rewrite_drift_guard", "iter": i, "text": rewritten2})
             rewritten = rewritten2
 
         candidate = rewritten
 
     # Final check after max iters
-    ok, violations, parsed = hard_validate(candidate)
+    ok, violations, parsed = validate_with_research(candidate, task, guideline, research_notes)
     return {
         "status": "PASS" if ok else "FAIL",
         "iterations": MAX_ITERS,
@@ -1285,10 +1479,18 @@ SR-01 Prefer short bullet items.
 
     TASK = "Explain Newton's 2nd law and give one numeric example."
 
-    result = self_revise(TASK, GUIDELINE)
-    print("STATUS:", result["status"])
-    print("ITERATIONS:", result["iterations"])
-    if result["status"] != "PASS":
-        print("LAST VIOLATIONS:", json.dumps(result["last_violations"], indent=2))
-    print(result["final_text"])
-    print(f"\nLog written to: {result['log_path']}")
+    try:
+        result = self_revise(TASK, GUIDELINE)
+    except KeyboardInterrupt:
+        print("STATUS: INTERRUPTED")
+        print("Run interrupted by user.")
+    else:
+        print("STATUS:", result["status"])
+        print("ITERATIONS:", result["iterations"])
+        if result["status"] not in {"PASS", "INTERRUPTED"}:
+            print("LAST VIOLATIONS:", json.dumps(result["last_violations"], indent=2))
+        if result.get("reason"):
+            print("REASON:", result["reason"])
+        if result.get("final_text"):
+            print(result["final_text"])
+        print(f"\nLog written to: {result['log_path']}")
