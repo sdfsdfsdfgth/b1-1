@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +10,7 @@ from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus, urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 from jsonschema import ValidationError, validate
@@ -52,7 +54,14 @@ MAX_FACTS = 12
 MIN_MULTI_SOURCE_CONFIRMATIONS = 2
 MAX_RESEARCH_QUERIES = 5
 RESEARCH_CACHE_PATH = Path(".research_cache.json")
+KNOWLEDGE_STORE_PATH = Path(".knowledge_store.json")
 MIN_CLAIM_TOKEN_OVERLAP = 0.45
+SEARCH_PROVIDER = "duckduckgo"  # duckduckgo | bing | google
+MAX_TOTAL_SEARCH_CALLS = 6
+MAX_TOTAL_PAGE_FETCHES = 18
+MAX_PAGES_PER_QUERY = 5
+REQUEST_DELAY_SECS = 0.2
+FRESHNESS_MAX_AGE_YEARS = 3
 
 AUTHORITATIVE_DOMAINS = {
     ".gov",
@@ -140,6 +149,16 @@ class SourceAwareViolation:
     fix: str
 
 
+@dataclass
+class SearchAuditEntry:
+    kind: str
+    timestamp: float
+    query: str = ""
+    url: str = ""
+    status: str = ""
+    detail: str = ""
+
+
 # =========================
 # NETWORK / CACHE
 # =========================
@@ -175,6 +194,19 @@ def save_fact_cache(cache: Dict[str, Dict[str, str]]) -> None:
 
 def cache_key(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def load_knowledge_store() -> Dict[str, Any]:
+    if not KNOWLEDGE_STORE_PATH.exists():
+        return {"facts": []}
+    try:
+        return json.loads(KNOWLEDGE_STORE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"facts": []}
+
+
+def save_knowledge_store(payload: Dict[str, Any]) -> None:
+    KNOWLEDGE_STORE_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 # =========================
@@ -233,15 +265,52 @@ def recency_score(title: str, snippet: str) -> float:
     return max(0.0, 1.5 - 0.25 * delta)
 
 
+def is_fresh_enough(source: ResearchSource, max_age_years: int = FRESHNESS_MAX_AGE_YEARS) -> bool:
+    years = [int(y) for y in re.findall(r"\b(20\d{2})\b", f"{source.title} {source.snippet}" or "")]
+    if not years:
+        return True
+    return (datetime.now().year - max(years)) <= max_age_years
+
+
+def can_fetch_url(robots_cache: Dict[str, RobotFileParser], url: str) -> bool:
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    if base not in robots_cache:
+        rp = RobotFileParser()
+        rp.set_url(f"{base}/robots.txt")
+        try:
+            rp.read()
+        except Exception:
+            return True
+        robots_cache[base] = rp
+    try:
+        return robots_cache[base].can_fetch(USER_AGENT, url)
+    except Exception:
+        return True
+
+
+def provider_urls(query: str) -> List[str]:
+    q = quote_plus(query)
+    if SEARCH_PROVIDER == "bing":
+        return [f"https://www.bing.com/search?q={q}"]
+    if SEARCH_PROVIDER == "google":
+        return [f"https://www.google.com/search?q={q}"]
+    return [
+        f"https://duckduckgo.com/html/?q={q}",
+        f"https://lite.duckduckgo.com/lite/?q={q}",
+    ]
+
+
 def web_search(session: requests.Session, query: str, max_results: int = MAX_SEARCH_RESULTS) -> List[ResearchSource]:
     """
-    Uses DuckDuckGo HTML endpoints and ranks results by authority + recency + position.
+    Uses configurable HTML search endpoints and ranks results by authority + recency + position.
     """
 
     def _parse_results(html: str) -> List[Tuple[str, str]]:
         patterns = [
             r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
             r'<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            r'<h2><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
             r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         ]
         for pat in patterns:
@@ -250,13 +319,8 @@ def web_search(session: requests.Session, query: str, max_results: int = MAX_SEA
                 return matches
         return []
 
-    candidate_urls = [
-        f"https://duckduckgo.com/html/?q={quote_plus(query)}",
-        f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}",
-    ]
-
     raw_matches: List[Tuple[str, str]] = []
-    for url in candidate_urls:
+    for url in provider_urls(query):
         try:
             resp = session.get(url, timeout=RESEARCH_TIMEOUT_SECS, allow_redirects=True)
             resp.raise_for_status()
@@ -273,17 +337,11 @@ def web_search(session: requests.Session, query: str, max_results: int = MAX_SEA
         if not href.startswith("http"):
             continue
         domain = urlparse(href).netloc.lower()
-        if "duckduckgo.com" in domain:
+        if SEARCH_PROVIDER in domain:
             continue
         score = domain_authority_score(href) + max(0.0, 1.2 - 0.12 * idx) + recency_score(title, "")
         ranked.append(
-            ResearchSource(
-                url=href,
-                title=title or href,
-                snippet="",
-                domain=domain,
-                score=score,
-            )
+            ResearchSource(url=href, title=title or href, snippet="", domain=domain, score=score)
         )
 
     ranked.sort(key=lambda r: r.score, reverse=True)
@@ -498,17 +556,12 @@ def build_research_context(
 
 def research_web(task: str, guideline: str) -> Dict[str, Any]:
     """
-    Full research flow:
-    - planning (query generation)
-    - search + ranking
-    - page fetching with redirect support, timeout, retries, caching
-    - scraping/extraction (text + targeted sections + regex captures)
-    - source tracking per fact
-    - multi-source verification + conflict flagging
-    - stopping policy when enough verified facts are collected
+    Research flow with search gating, budget limits, rate-limit friendliness,
+    parallel page fetches, partial-failure reporting, and replayable audit logs.
     """
     session = build_http_session()
     cache = load_fact_cache()
+    robots_cache: Dict[str, RobotFileParser] = {}
 
     planned_queries = generate_search_queries(task)
     all_sources: List[ResearchSource] = []
@@ -517,62 +570,83 @@ def research_web(task: str, guideline: str) -> Dict[str, Any]:
     aggregated_targeted = {"headings": [], "list_items": [], "table_cells": []}
     seen_urls: Set[str] = set()
     issued_queries: List[str] = []
+    audit_log: List[Dict[str, Any]] = []
+    failures: List[str] = []
 
     query_queue = list(planned_queries)
+    search_calls = 0
+    page_fetches = 0
 
-    while query_queue and len(issued_queries) < MAX_RESEARCH_QUERIES:
+    while query_queue and len(issued_queries) < MAX_RESEARCH_QUERIES and search_calls < MAX_TOTAL_SEARCH_CALLS:
         query = query_queue.pop(0)
         issued_queries.append(query)
+        search_calls += 1
+        audit_log.append({"kind": "query", "ts": time.time(), "query": query, "status": "issued"})
 
         try:
-            ranked_results = web_search(session, query)
-        except Exception:
+            ranked_results = web_search(session, query, max_results=min(MAX_SEARCH_RESULTS, MAX_PAGES_PER_QUERY))
+        except Exception as e:
+            failures.append(f"query failed: {query} ({e})")
+            audit_log.append({"kind": "query", "ts": time.time(), "query": query, "status": "failed", "detail": str(e)})
             continue
 
+        ranked_results = [r for r in ranked_results if is_fresh_enough(r)]
+        if not ranked_results:
+            failures.append(f"no fresh sources for query: {query}")
+            continue
+
+        fetch_batch: List[ResearchSource] = []
         for source in ranked_results:
-            if source.url in seen_urls:
+            if source.url in seen_urls or page_fetches >= MAX_TOTAL_PAGE_FETCHES:
+                continue
+            if not can_fetch_url(robots_cache, source.url):
+                audit_log.append({"kind": "url", "ts": time.time(), "query": query, "url": source.url, "status": "blocked_robots"})
                 continue
             seen_urls.add(source.url)
+            fetch_batch.append(source)
 
-            try:
-                html = fetch_page_html(session, source.url, cache)
-            except Exception:
-                continue
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_page_html, session, src.url, cache): src for src in fetch_batch}
+            for fut in as_completed(futures):
+                if page_fetches >= MAX_TOTAL_PAGE_FETCHES:
+                    break
+                src = futures[fut]
+                page_fetches += 1
+                time.sleep(REQUEST_DELAY_SECS)
+                try:
+                    html = fut.result()
+                except Exception as e:
+                    failures.append(f"fetch failed: {src.url} ({e})")
+                    audit_log.append({"kind": "url", "ts": time.time(), "query": query, "url": src.url, "status": "failed", "detail": str(e)})
+                    continue
 
-            snippet, facts, targeted = extract_facts_from_page(source, html)
-            source.snippet = snippet
-            all_sources.append(source)
-            extracted_facts.extend(facts)
+                snippet, facts, targeted = extract_facts_from_page(src, html)
+                src.snippet = snippet
+                all_sources.append(src)
+                extracted_facts.extend(facts)
+                cleaned_text = strip_navigation_and_ads(html)
+                aggregated_regex.extend(regex_capture_data(cleaned_text))
+                for k in aggregated_targeted:
+                    aggregated_targeted[k].extend(targeted.get(k, []))
 
-            cleaned_text = strip_navigation_and_ads(html)
-            aggregated_regex.extend(regex_capture_data(cleaned_text))
-            for k in aggregated_targeted:
-                aggregated_targeted[k].extend(targeted.get(k, []))
+                audit_log.append({"kind": "url", "ts": time.time(), "query": query, "url": src.url, "status": "ok", "facts": len(facts)})
 
-            verified = verify_facts(extracted_facts)
-            if len(verified) >= 3 and len(all_sources) >= 3:
-                # enough breadth and verification to stop early
-                save_fact_cache(cache)
-                return {
-                    "required": True,
-                    "queries": issued_queries,
-                    "sources": [s.__dict__ for s in all_sources[:MAX_RESEARCH_SOURCES]],
-                    "verified_facts": [v.__dict__ for v in verified],
-                    "context": build_research_context(
-                        all_sources[:MAX_RESEARCH_SOURCES],
-                        verified,
-                        aggregated_regex,
-                        aggregated_targeted,
-                    ),
-                }
+        verified = verify_facts(extracted_facts)
+        if len(verified) >= 3 and len(all_sources) >= 3:
+            break
 
-        refined = refine_queries(task, all_sources, extracted_facts)
-        for rq in refined:
+        for rq in refine_queries(task, all_sources, extracted_facts):
             if rq.lower() not in {q.lower() for q in issued_queries + query_queue}:
                 query_queue.append(rq)
 
     save_fact_cache(cache)
     verified = verify_facts(extracted_facts)
+    store = load_knowledge_store()
+    store.setdefault("facts", []).extend(
+        {"text": v.text, "source_urls": v.source_urls, "conflict": v.conflict, "ts": time.time()}
+        for v in verified
+    )
+    save_knowledge_store(store)
 
     return {
         "required": True,
@@ -585,7 +659,18 @@ def research_web(task: str, guideline: str) -> Dict[str, Any]:
             aggregated_regex,
             aggregated_targeted,
         ),
+        "audit": audit_log,
+        "failures": failures,
+        "partial": bool(failures),
+        "budget": {
+            "max_search_calls": MAX_TOTAL_SEARCH_CALLS,
+            "used_search_calls": search_calls,
+            "max_page_fetches": MAX_TOTAL_PAGE_FETCHES,
+            "used_page_fetches": page_fetches,
+        },
+        "provider": SEARCH_PROVIDER,
     }
+
 
 
 # =========================
@@ -625,15 +710,52 @@ def recency_score(title: str, snippet: str) -> float:
     return max(0.0, 1.5 - 0.25 * delta)
 
 
+def is_fresh_enough(source: ResearchSource, max_age_years: int = FRESHNESS_MAX_AGE_YEARS) -> bool:
+    years = [int(y) for y in re.findall(r"\b(20\d{2})\b", f"{source.title} {source.snippet}" or "")]
+    if not years:
+        return True
+    return (datetime.now().year - max(years)) <= max_age_years
+
+
+def can_fetch_url(robots_cache: Dict[str, RobotFileParser], url: str) -> bool:
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    if base not in robots_cache:
+        rp = RobotFileParser()
+        rp.set_url(f"{base}/robots.txt")
+        try:
+            rp.read()
+        except Exception:
+            return True
+        robots_cache[base] = rp
+    try:
+        return robots_cache[base].can_fetch(USER_AGENT, url)
+    except Exception:
+        return True
+
+
+def provider_urls(query: str) -> List[str]:
+    q = quote_plus(query)
+    if SEARCH_PROVIDER == "bing":
+        return [f"https://www.bing.com/search?q={q}"]
+    if SEARCH_PROVIDER == "google":
+        return [f"https://www.google.com/search?q={q}"]
+    return [
+        f"https://duckduckgo.com/html/?q={q}",
+        f"https://lite.duckduckgo.com/lite/?q={q}",
+    ]
+
+
 def web_search(session: requests.Session, query: str, max_results: int = MAX_SEARCH_RESULTS) -> List[ResearchSource]:
     """
-    Uses DuckDuckGo HTML endpoints and ranks results by authority + recency + position.
+    Uses configurable HTML search endpoints and ranks results by authority + recency + position.
     """
 
     def _parse_results(html: str) -> List[Tuple[str, str]]:
         patterns = [
             r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
             r'<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            r'<h2><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
             r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         ]
         for pat in patterns:
@@ -642,13 +764,8 @@ def web_search(session: requests.Session, query: str, max_results: int = MAX_SEA
                 return matches
         return []
 
-    candidate_urls = [
-        f"https://duckduckgo.com/html/?q={quote_plus(query)}",
-        f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}",
-    ]
-
     raw_matches: List[Tuple[str, str]] = []
-    for url in candidate_urls:
+    for url in provider_urls(query):
         try:
             resp = session.get(url, timeout=RESEARCH_TIMEOUT_SECS, allow_redirects=True)
             resp.raise_for_status()
@@ -665,17 +782,11 @@ def web_search(session: requests.Session, query: str, max_results: int = MAX_SEA
         if not href.startswith("http"):
             continue
         domain = urlparse(href).netloc.lower()
-        if "duckduckgo.com" in domain:
+        if SEARCH_PROVIDER in domain:
             continue
         score = domain_authority_score(href) + max(0.0, 1.2 - 0.12 * idx) + recency_score(title, "")
         ranked.append(
-            ResearchSource(
-                url=href,
-                title=title or href,
-                snippet="",
-                domain=domain,
-                score=score,
-            )
+            ResearchSource(url=href, title=title or href, snippet="", domain=domain, score=score)
         )
 
     ranked.sort(key=lambda r: r.score, reverse=True)
@@ -890,17 +1001,12 @@ def build_research_context(
 
 def research_web(task: str, guideline: str) -> Dict[str, Any]:
     """
-    Full research flow:
-    - planning (query generation)
-    - search + ranking
-    - page fetching with redirect support, timeout, retries, caching
-    - scraping/extraction (text + targeted sections + regex captures)
-    - source tracking per fact
-    - multi-source verification + conflict flagging
-    - stopping policy when enough verified facts are collected
+    Research flow with search gating, budget limits, rate-limit friendliness,
+    parallel page fetches, partial-failure reporting, and replayable audit logs.
     """
     session = build_http_session()
     cache = load_fact_cache()
+    robots_cache: Dict[str, RobotFileParser] = {}
 
     planned_queries = generate_search_queries(task)
     all_sources: List[ResearchSource] = []
@@ -909,62 +1015,83 @@ def research_web(task: str, guideline: str) -> Dict[str, Any]:
     aggregated_targeted = {"headings": [], "list_items": [], "table_cells": []}
     seen_urls: Set[str] = set()
     issued_queries: List[str] = []
+    audit_log: List[Dict[str, Any]] = []
+    failures: List[str] = []
 
     query_queue = list(planned_queries)
+    search_calls = 0
+    page_fetches = 0
 
-    while query_queue and len(issued_queries) < MAX_RESEARCH_QUERIES:
+    while query_queue and len(issued_queries) < MAX_RESEARCH_QUERIES and search_calls < MAX_TOTAL_SEARCH_CALLS:
         query = query_queue.pop(0)
         issued_queries.append(query)
+        search_calls += 1
+        audit_log.append({"kind": "query", "ts": time.time(), "query": query, "status": "issued"})
 
         try:
-            ranked_results = web_search(session, query)
-        except Exception:
+            ranked_results = web_search(session, query, max_results=min(MAX_SEARCH_RESULTS, MAX_PAGES_PER_QUERY))
+        except Exception as e:
+            failures.append(f"query failed: {query} ({e})")
+            audit_log.append({"kind": "query", "ts": time.time(), "query": query, "status": "failed", "detail": str(e)})
             continue
 
+        ranked_results = [r for r in ranked_results if is_fresh_enough(r)]
+        if not ranked_results:
+            failures.append(f"no fresh sources for query: {query}")
+            continue
+
+        fetch_batch: List[ResearchSource] = []
         for source in ranked_results:
-            if source.url in seen_urls:
+            if source.url in seen_urls or page_fetches >= MAX_TOTAL_PAGE_FETCHES:
+                continue
+            if not can_fetch_url(robots_cache, source.url):
+                audit_log.append({"kind": "url", "ts": time.time(), "query": query, "url": source.url, "status": "blocked_robots"})
                 continue
             seen_urls.add(source.url)
+            fetch_batch.append(source)
 
-            try:
-                html = fetch_page_html(session, source.url, cache)
-            except Exception:
-                continue
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_page_html, session, src.url, cache): src for src in fetch_batch}
+            for fut in as_completed(futures):
+                if page_fetches >= MAX_TOTAL_PAGE_FETCHES:
+                    break
+                src = futures[fut]
+                page_fetches += 1
+                time.sleep(REQUEST_DELAY_SECS)
+                try:
+                    html = fut.result()
+                except Exception as e:
+                    failures.append(f"fetch failed: {src.url} ({e})")
+                    audit_log.append({"kind": "url", "ts": time.time(), "query": query, "url": src.url, "status": "failed", "detail": str(e)})
+                    continue
 
-            snippet, facts, targeted = extract_facts_from_page(source, html)
-            source.snippet = snippet
-            all_sources.append(source)
-            extracted_facts.extend(facts)
+                snippet, facts, targeted = extract_facts_from_page(src, html)
+                src.snippet = snippet
+                all_sources.append(src)
+                extracted_facts.extend(facts)
+                cleaned_text = strip_navigation_and_ads(html)
+                aggregated_regex.extend(regex_capture_data(cleaned_text))
+                for k in aggregated_targeted:
+                    aggregated_targeted[k].extend(targeted.get(k, []))
 
-            cleaned_text = strip_navigation_and_ads(html)
-            aggregated_regex.extend(regex_capture_data(cleaned_text))
-            for k in aggregated_targeted:
-                aggregated_targeted[k].extend(targeted.get(k, []))
+                audit_log.append({"kind": "url", "ts": time.time(), "query": query, "url": src.url, "status": "ok", "facts": len(facts)})
 
-            verified = verify_facts(extracted_facts)
-            if len(verified) >= 3 and len(all_sources) >= 3:
-                # enough breadth and verification to stop early
-                save_fact_cache(cache)
-                return {
-                    "required": True,
-                    "queries": issued_queries,
-                    "sources": [s.__dict__ for s in all_sources[:MAX_RESEARCH_SOURCES]],
-                    "verified_facts": [v.__dict__ for v in verified],
-                    "context": build_research_context(
-                        all_sources[:MAX_RESEARCH_SOURCES],
-                        verified,
-                        aggregated_regex,
-                        aggregated_targeted,
-                    ),
-                }
+        verified = verify_facts(extracted_facts)
+        if len(verified) >= 3 and len(all_sources) >= 3:
+            break
 
-        refined = refine_queries(task, all_sources, extracted_facts)
-        for rq in refined:
+        for rq in refine_queries(task, all_sources, extracted_facts):
             if rq.lower() not in {q.lower() for q in issued_queries + query_queue}:
                 query_queue.append(rq)
 
     save_fact_cache(cache)
     verified = verify_facts(extracted_facts)
+    store = load_knowledge_store()
+    store.setdefault("facts", []).extend(
+        {"text": v.text, "source_urls": v.source_urls, "conflict": v.conflict, "ts": time.time()}
+        for v in verified
+    )
+    save_knowledge_store(store)
 
     return {
         "required": True,
@@ -977,7 +1104,18 @@ def research_web(task: str, guideline: str) -> Dict[str, Any]:
             aggregated_regex,
             aggregated_targeted,
         ),
+        "audit": audit_log,
+        "failures": failures,
+        "partial": bool(failures),
+        "budget": {
+            "max_search_calls": MAX_TOTAL_SEARCH_CALLS,
+            "used_search_calls": search_calls,
+            "max_page_fetches": MAX_TOTAL_PAGE_FETCHES,
+            "used_page_fetches": page_fetches,
+        },
+        "provider": SEARCH_PROVIDER,
     }
+
 
 
 # =========================
@@ -1043,6 +1181,11 @@ def build_structured_research_notes(research: Dict[str, Any]) -> Dict[str, Any]:
         "queries": research.get("queries", []),
         "fact_count": len(facts),
         "source_count": len(sources),
+        "audit": research.get("audit", []),
+        "failures": research.get("failures", []),
+        "budget": research.get("budget", {}),
+        "provider": research.get("provider", SEARCH_PROVIDER),
+        "partial": bool(research.get("partial", False)),
         "facts": [
             {
                 "text": f.get("text", ""),
@@ -1065,6 +1208,12 @@ def build_structured_research_notes(research: Dict[str, Any]) -> Dict[str, Any]:
 
 def citations_required(task: str, guideline: str) -> bool:
     return bool(re.search(r"\b(cite|citation|citations|required source|sources required)\b", f"{task}\n{guideline}", flags=re.IGNORECASE))
+
+
+def allowed_to_search(task: str, guideline: str) -> Tuple[bool, str]:
+    if needs_research(task, guideline):
+        return True, "research-trigger keywords present"
+    return False, "search gating blocked web lookup"
 
 
 def tokenize_claim(text: str) -> Set[str]:
@@ -1098,6 +1247,41 @@ def extract_candidate_claims(parsed_obj: Dict[str, Any]) -> List[Tuple[str, str]
         for idx, sentence in enumerate(sentences):
             claims.append((f"$.solution[{idx}]", sentence))
     return claims
+
+
+def map_claims_to_verified_facts(parsed_obj: Optional[Dict[str, Any]], research_notes: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not parsed_obj:
+        return []
+    mapped: List[Dict[str, Any]] = []
+    facts = research_notes.get("facts", [])
+    for location, claim in extract_candidate_claims(parsed_obj):
+        best_score = 0.0
+        best_fact: Dict[str, Any] = {}
+        for fact in facts:
+            score = claim_support_score(claim, fact.get("text", ""))
+            if score > best_score:
+                best_score = score
+                best_fact = fact
+        mapped.append({
+            "location": location,
+            "claim": claim,
+            "matched_fact": best_fact.get("text", ""),
+            "score": best_score,
+            "source_urls": best_fact.get("source_urls", []),
+        })
+    return mapped
+
+
+def citation_violations(parsed_obj: Optional[Dict[str, Any]], research_notes: Dict[str, Any], required: bool) -> List[Violation]:
+    if not required or not parsed_obj:
+        return []
+    out: List[Violation] = []
+    for row in map_claims_to_verified_facts(parsed_obj, research_notes):
+        if len(tokenize_claim(row["claim"])) < 5:
+            continue
+        if row["score"] < MIN_CLAIM_TOKEN_OVERLAP or not row["source_urls"]:
+            out.append(Violation("RV-04", "Claim lacks citation-backed support.", row["location"]))
+    return out
 
 
 def source_aware_critic(parsed_obj: Optional[Dict[str, Any]], research_notes: Dict[str, Any], citation_is_required: bool) -> List[SourceAwareViolation]:
@@ -1157,6 +1341,14 @@ def validate_with_research(
         )
         for v in source_violations
     )
+    violations.extend(citation_violations(parsed, research_notes, citation_is_required))
+
+    for mapping in map_claims_to_verified_facts(parsed, research_notes):
+        if len(tokenize_claim(mapping["claim"])) < 5:
+            continue
+        if mapping["score"] < MIN_CLAIM_TOKEN_OVERLAP:
+            violations.append(Violation("RV-05", "Claim could not be aligned to verified facts.", mapping["location"]))
+
     return len(violations) == 0, violations, parsed
 
 # =========================
@@ -1335,7 +1527,9 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
     research_notes: Dict[str, Any] = {"required": False, "facts": [], "sources": []}
 
     # 1) Research phase (pre-generation)
-    if needs_research(task, guideline):
+    search_allowed, search_reason = allowed_to_search(task, guideline)
+    log({"phase": "search_gate", "allowed": search_allowed, "reason": search_reason})
+    if search_allowed:
         try:
             research = research_web(task, guideline)
         except KeyboardInterrupt:
