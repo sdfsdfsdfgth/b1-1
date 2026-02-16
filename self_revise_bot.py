@@ -70,6 +70,8 @@ SELF_IMPROVEMENT_ENABLED = True
 SELF_IMPROVEMENT_MAX_SOURCE_CHARS = 14000
 SELF_IMPROVEMENT_REPORT_PATH = Path("self_improvement_report.json")
 SELF_IMPROVEMENT_SUGGESTIONS_PATH = Path("self_improvement_suggestions.md")
+SELF_REWRITE_REPORT_PATH = Path("self_rewrite_report.json")
+SELF_REWRITE_BACKUP_PATH = Path("self_revise_bot.py.bak")
 
 AUTHORITATIVE_DOMAINS = {
     ".gov",
@@ -1514,6 +1516,127 @@ Now output the corrected JSON only.
 
 
 
+def current_capabilities() -> List[str]:
+    return [
+        "Iterative generate→validate→critic→rewrite loop with max-iteration guard",
+        "Schema and rule-based deterministic validation with source-aware checks",
+        "Optional web research pipeline with caching and authority/recency scoring",
+        "Ollama /api/generate integration with retries, timeout, and token caps",
+        "Rewrite drift guard that limits excessive edits",
+        "AI brainstorming that outputs self-improvement ideas and rewrite snippets",
+    ]
+
+
+def prompt_requested_features() -> List[str]:
+    print("\n✨ Current capabilities:")
+    for idx, item in enumerate(current_capabilities(), start=1):
+        print(f"  {idx}. {item}")
+
+    print("\nWhat features should I add to my own code?")
+    print("- Enter one feature per line. Press Enter on an empty line to finish.")
+
+    requested: List[str] = []
+    while True:
+        try:
+            line = input("feature> ").strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        requested.append(line)
+    return requested
+
+
+def self_rewrite_prompt(
+    source_code: str,
+    requested_features: List[str],
+    recent_result: Dict[str, Any],
+) -> str:
+    run_summary = {
+        "status": recent_result.get("status"),
+        "iterations": recent_result.get("iterations"),
+        "last_violations": recent_result.get("last_violations", [])[:5],
+    }
+    return f"""
+SYSTEM:
+You are rewriting this Python file to implement requested new features.
+
+GOAL:
+- Return the COMPLETE updated Python file as plain text.
+- Keep existing behavior unless a requested feature requires changes.
+- Preserve deterministic validation behavior and Ollama request handling.
+
+REQUESTED FEATURES:
+{json.dumps(requested_features, ensure_ascii=False, indent=2)}
+
+CURRENT CAPABILITIES:
+{json.dumps(current_capabilities(), ensure_ascii=False, indent=2)}
+
+RECENT RUN SUMMARY:
+{json.dumps(run_summary, ensure_ascii=False, indent=2)}
+
+OUTPUT RULES:
+- Return only Python source code for the full file.
+- No markdown fences. No commentary.
+- Ensure syntax is valid Python.
+
+CURRENT SOURCE:
+{source_code}
+""".strip()
+
+
+def _extract_python_source(raw: str) -> str:
+    fenced = re.search(r"```(?:python)?\s*(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+    return raw.strip()
+
+
+def _validate_python_source(source_text: str, filename: str) -> Tuple[bool, str]:
+    try:
+        compile(source_text, filename, "exec")
+        return True, ""
+    except SyntaxError as e:
+        return False, f"{e.msg} (line {e.lineno})"
+
+
+def self_rewrite_code(
+    requested_features: List[str],
+    recent_result: Dict[str, Any],
+    source_path: Path = Path(__file__),
+) -> Dict[str, Any]:
+    if not requested_features:
+        return {"applied": False, "reason": "No requested features provided."}
+
+    source = source_path.read_text(encoding="utf-8")
+    prompt = self_rewrite_prompt(source, requested_features, recent_result)
+
+    raw = call_ollama(REWRITE_MODEL, prompt, temperature=0.2)
+    rewritten_source = _extract_python_source(raw)
+    valid, error = _validate_python_source(rewritten_source, str(source_path))
+
+    report: Dict[str, Any] = {
+        "model": REWRITE_MODEL,
+        "requested_features": requested_features,
+        "valid_python": valid,
+        "syntax_error": error,
+        "applied": False,
+    }
+
+    if valid and rewritten_source and rewritten_source != source:
+        SELF_REWRITE_BACKUP_PATH.write_text(source, encoding="utf-8")
+        source_path.write_text(rewritten_source, encoding="utf-8")
+        report["applied"] = True
+        report["backup_path"] = str(SELF_REWRITE_BACKUP_PATH)
+    elif rewritten_source == source:
+        report["reason"] = "Model returned source identical to current file."
+    else:
+        report["reason"] = "Generated source was invalid Python and was not applied."
+
+    SELF_REWRITE_REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
 def self_improvement_prompt(source_code: str, recent_result: Dict[str, Any]) -> str:
     summary = {
         "status": recent_result.get("status"),
@@ -1831,3 +1954,12 @@ SR-01 Prefer short bullet items.
             ideas = improvement_report.get("result", {}).get("brainstorm", [])
             print(f"✅ Saved {len(ideas)} brainstorm ideas to {SELF_IMPROVEMENT_REPORT_PATH}")
             print(f"✅ Saved rewrite suggestions to {SELF_IMPROVEMENT_SUGGESTIONS_PATH}")
+
+            requested_features = prompt_requested_features()
+            rewrite_report = self_rewrite_code(requested_features, result)
+            if rewrite_report.get("applied"):
+                print("✅ Applied AI self-rewrite to source code.")
+                print(f"✅ Backup written to {rewrite_report.get('backup_path')}")
+            else:
+                print(f"⚠️ Self-rewrite not applied: {rewrite_report.get('reason', 'unknown reason')}")
+            print(f"ℹ️ Rewrite report: {SELF_REWRITE_REPORT_PATH}")
