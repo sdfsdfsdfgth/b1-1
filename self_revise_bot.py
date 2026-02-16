@@ -79,15 +79,10 @@ def call_ollama(model: str, prompt: str, temperature: float) -> str:
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Attempts to extract the first JSON object from a model response.
-    This handles common model behavior where it adds leading/trailing text.
-    """
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON object found in response")
-    return json.loads(text[start : end + 1])
+    s = text.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        raise ValueError("Response must be ONLY a JSON object with no extra text.")
+    return json.loads(s)
 
 
 def normalized_edit_ratio(a: str, b: str) -> float:
@@ -103,6 +98,10 @@ def normalized_edit_ratio(a: str, b: str) -> float:
 
 def hard_validate(raw_text: str) -> Tuple[bool, List[Violation], Optional[Dict[str, Any]]]:
     violations: List[Violation] = []
+    s = raw_text.strip()
+
+    if not (s.startswith("{") and s.endswith("}")):
+        violations.append(Violation("HR-05", "Extra text outside JSON object", "$"))
 
     if len(raw_text) > MAX_OUTPUT_CHARS:
         violations.append(
@@ -135,23 +134,29 @@ def hard_validate(raw_text: str) -> Tuple[bool, List[Violation], Optional[Dict[s
 
 def generator_prompt(task: str, guideline: str) -> str:
     return f"""
-You are the GENERATOR.
+SYSTEM:
+You are the GENERATOR. Produce the final answer for the task.
 
-Goal: produce an output that complies with ALL hard rules and the guideline.
+NON-NEGOTIABLE OUTPUT CONTRACT:
+- Output MUST be a single JSON object and NOTHING ELSE.
+- Do NOT include markdown, backticks, code fences, comments, or explanations.
+- Do NOT include any text before '{{' or after '}}'.
+- Keys MUST be exactly: "givens", "unknown", "equations", "solve", "solution".
+- No additional keys. No nulls. No empty strings.
 
-Hard rules:
-- Output MUST be valid JSON (one object).
-- Keys MUST be exactly: givens, unknown, equations, solve, solution.
-- No extra keys.
-- No commentary outside JSON.
-
-Guideline (with rule IDs):
+HARD RULES (MUST PASS):
 {guideline}
 
-Task:
+TASK:
 {task}
 
-Return JSON only.
+INTERNAL SELF-CHECK BEFORE YOU OUTPUT:
+1) Is the output valid JSON? (parseable)
+2) Does it contain ONLY the 5 keys? (no extras)
+3) Do types match? (arrays of strings; solution is string)
+4) No forbidden phrases; no extra text outside JSON.
+
+Now output the JSON object only.
 """.strip()
 
 
@@ -163,52 +168,61 @@ def critic_prompt(
 ) -> str:
     v = [vi.__dict__ for vi in validator_violations]
     return f"""
-You are the CRITIC/VERIFIER.
+SYSTEM:
+You are the CRITIC. You do NOT rewrite. You ONLY diagnose violations.
 
-You do NOT rewrite. You ONLY produce a defect list.
-
-Output MUST be valid JSON only in this exact format:
+NON-NEGOTIABLE OUTPUT CONTRACT:
+Return ONE JSON object and NOTHING ELSE (no markdown, no backticks, no extra text).
+The JSON MUST follow this exact schema:
 {{
   "violations_hard": [
-    {{"rule_id":"HR-xx or guideline id","location":"$.path or text span","problem":"...","fix":"..."}}
+    {{"rule_id":"HR-xx or guideline id","location":"$.path or 'raw_text'","problem":"...","fix":"..."}}
   ],
   "violations_soft": [
-    {{"rule_id":"SR-xx","problem":"...","fix":"..."}}
+    {{"rule_id":"SR-xx","location":"$.path or 'raw_text'","problem":"...","fix":"..."}}
   ]
 }}
 
-Rules:
-- Every violation MUST cite a rule_id.
-- If a deterministic validator already flagged an issue, include it and propose a fix.
-- Do not invent violations.
-- Be specific about location and fix.
-- Return JSON only.
+RULES FOR YOUR DIAGNOSIS:
+- Every item MUST cite a real rule_id from the guideline or HR-01..HR-05.
+- Location must be specific (JSONPath like $.solution or $.givens[0]) when possible.
+- Only include violations that are actually present.
+- The "fix" must be concrete and minimal (tell the rewriter exactly what to change).
+- If deterministic validator violations exist, you MUST include them in violations_hard.
 
-Guideline (with rule IDs):
+GUIDELINE (WITH RULE IDS):
 {guideline}
 
-Task:
+TASK:
 {task}
 
-Candidate:
+CANDIDATE (may be invalid / may have extra text):
 {candidate}
 
-Deterministic validator violations (authoritative):
+DETERMINISTIC VALIDATOR VIOLATIONS (AUTHORITATIVE):
 {json.dumps(v, indent=2)}
+
+Now output the JSON defect list only.
 """.strip()
 
 
 def rewriter_prompt(guideline: str, candidate: str, defects: Dict[str, Any]) -> str:
     return f"""
-You are the REWRITER.
+SYSTEM:
+You are the REWRITER. Apply FIXES ONLY. Do not improve style unless required by a listed violation.
 
-Apply FIXES ONLY from the defect list. Do not modify compliant content.
+NON-NEGOTIABLE OUTPUT CONTRACT:
+- Output MUST be a single JSON object and NOTHING ELSE.
+- No markdown, no backticks, no code fences, no commentary.
+- Do NOT include any text before '{{' or after '}}'.
+- Keys MUST be exactly: "givens", "unknown", "equations", "solve", "solution".
+- No additional keys. No nulls.
 
-Hard rules:
-- Output MUST be valid JSON (one object).
-- Keys MUST be exactly: givens, unknown, equations, solve, solution.
-- No extra keys.
-- Return JSON only.
+STRICT REWRITE RULES:
+1) Only change fields necessary to fix the listed violations.
+2) Preserve all other content verbatim.
+3) If the candidate is invalid JSON, reconstruct it into valid JSON while preserving content as much as possible.
+4) Do not introduce new information not required for compliance.
 
 Guideline:
 {guideline}
@@ -218,6 +232,15 @@ Candidate:
 
 Defect list (apply these fixes exactly):
 {json.dumps(defects, indent=2)}
+
+INTERNAL SELF-CHECK BEFORE OUTPUT:
+- Valid JSON only
+- Exactly 5 keys
+- Types correct
+- No extra text outside JSON
+- All listed hard violations fixed
+
+Now output the corrected JSON only.
 """.strip()
 
 
@@ -338,6 +361,7 @@ HR-01 Output must be <= 2000 characters.
 HR-02 Must not include 'I think' or 'as an AI'.
 HR-03 Must be valid JSON (single object).
 HR-04 Must match schema exactly (no extra keys).
+HR-05 Must not include extra text outside the JSON object.
 SR-01 Prefer short bullet items.
 """.strip()
 
