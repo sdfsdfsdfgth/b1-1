@@ -27,8 +27,8 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 USER_AGENT = "self-revise-bot/1.0 (+https://example.local)"
 
 GEN_MODEL = "llama3.1:8b"
-CRITIC_MODEL = "qwen2.5:7b"
-REWRITE_MODEL = "qwen2.5:7b"
+CRITIC_MODEL = "llama3.1:8b"
+REWRITE_MODEL = "llama3.1:8b"
 
 MAX_ITERS = 5
 CRITIC_TEMP = 0.1
@@ -217,18 +217,20 @@ def save_knowledge_store(payload: Dict[str, Any]) -> None:
 def call_ollama(model: str, prompt: str, temperature: float) -> str:
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
         "stream": False,
         "options": {"temperature": temperature},
     }
 
     resp = requests.post(
-        OLLAMA_URL,
+        "http://localhost:11434/api/chat",
         json=payload,
         timeout=120,
     )
     resp.raise_for_status()
-    return resp.json()["response"]
+    return resp.json()["message"]["content"]
 
 
 # =========================
@@ -1528,8 +1530,10 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
     search_allowed, search_reason = allowed_to_search(task, guideline)
     log({"phase": "search_gate", "allowed": search_allowed, "reason": search_reason})
     if search_allowed:
+        print("\n🔍 Starting web research...")
         try:
             research = research_web(task, guideline)
+            print(f"✅ Research complete: {len(research.get('sources', []))} sources, {len(research.get('verified_facts', []))} verified facts")
         except KeyboardInterrupt:
             log({"phase": "interrupted", "stage": "research"})
             return interrupted_result("Interrupted during research phase.", log_path)
@@ -1540,6 +1544,7 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         log({"phase": "research_notes", "notes": research_notes})
 
     # 2) Generate
+    print("\n📝 Generating initial response...")
     try:
         candidate = call_ollama(
             GEN_MODEL,
@@ -1551,6 +1556,7 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
             ),
             temperature=GEN_TEMP,
         )
+        print("✅ Generation complete")
     except KeyboardInterrupt:
         log({"phase": "interrupted", "stage": "generate"})
         return interrupted_result("Interrupted during generation phase.", log_path)
@@ -1559,6 +1565,7 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
     last_violations: List[Violation] = []
 
     for i in range(1, MAX_ITERS + 1):
+        print(f"\n🔄 Iteration {i}/{MAX_ITERS}: Validating...")
         ok, violations, parsed = validate_with_research(candidate, task, guideline, research_notes)
         last_violations = violations
         log(
@@ -1571,6 +1578,7 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         )
 
         if ok:
+            print(f"✅ PASS at iteration {i}!")
             return {
                 "status": "PASS",
                 "iterations": i,
@@ -1581,6 +1589,7 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
             }
 
         # 2) Critique
+        print(f"   → Found {len(violations)} violations. Critiquing...")
         try:
             critic_out = call_ollama(
                 CRITIC_MODEL,
@@ -1612,6 +1621,7 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         log({"phase": "critic_json", "iter": i, "defects": defects})
 
         # 3) Rewrite
+        print(f"   → Rewriting based on feedback...")
         try:
             rewritten = call_ollama(
                 REWRITE_MODEL,
@@ -1644,9 +1654,12 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
         candidate = rewritten
 
     # Final check after max iters
+    print(f"\n⚠️  Reached max iterations ({MAX_ITERS}). Final validation...")
     ok, violations, parsed = validate_with_research(candidate, task, guideline, research_notes)
+    status = "PASS" if ok else "FAIL"
+    print(f"\n📊 FINAL STATUS: {status}")
     return {
-        "status": "PASS" if ok else "FAIL",
+        "status": status,
         "iterations": MAX_ITERS,
         "final_text": candidate,
         "final_json": parsed,
