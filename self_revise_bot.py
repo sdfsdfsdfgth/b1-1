@@ -62,6 +62,10 @@ MAX_TOTAL_PAGE_FETCHES = 18
 MAX_PAGES_PER_QUERY = 5
 REQUEST_DELAY_SECS = 0.2
 FRESHNESS_MAX_AGE_YEARS = 3
+OLLAMA_TIMEOUT_SECS = 300
+OLLAMA_MAX_RETRIES = 3
+OLLAMA_NUM_PREDICT = 600
+MAX_CANDIDATE_FOR_CRITIC = 6000
 
 AUTHORITATIVE_DOMAINS = {
     ".gov",
@@ -217,20 +221,29 @@ def save_knowledge_store(payload: Dict[str, Any]) -> None:
 def call_ollama(model: str, prompt: str, temperature: float) -> str:
     payload = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "prompt": prompt,
         "stream": False,
-        "options": {"temperature": temperature},
+        "options": {
+            "temperature": temperature,
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
     }
 
-    resp = requests.post(
-        "http://localhost:11434/api/chat",
-        json=payload,
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
+    for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                OLLAMA_URL,
+                json=payload,
+                timeout=OLLAMA_TIMEOUT_SECS,
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+        except requests.exceptions.ReadTimeout:
+            if attempt == OLLAMA_MAX_RETRIES:
+                raise
+            time.sleep(2 * attempt)
+
+    return ""
 
 
 # =========================
@@ -1590,10 +1603,15 @@ def self_revise(task: str, guideline: str, log_path: str = "run_log.jsonl") -> D
 
         # 2) Critique
         print(f"   → Found {len(violations)} violations. Critiquing...")
+        if len(candidate) > MAX_CANDIDATE_FOR_CRITIC:
+            candidate_for_critic = candidate[:MAX_CANDIDATE_FOR_CRITIC] + "\n...[TRUNCATED]..."
+        else:
+            candidate_for_critic = candidate
+
         try:
             critic_out = call_ollama(
                 CRITIC_MODEL,
-                critic_prompt(task, guideline, candidate, violations, research_notes=research_notes),
+                critic_prompt(task, guideline, candidate_for_critic, violations, research_notes=research_notes),
                 temperature=CRITIC_TEMP,
             )
         except KeyboardInterrupt:
