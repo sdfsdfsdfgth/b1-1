@@ -2,12 +2,16 @@ import hashlib
 import json
 import re
 import time
+from html import unescape
 from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus, urlparse
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
+
 
 import requests
 from jsonschema import ValidationError, validate
