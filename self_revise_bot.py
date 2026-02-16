@@ -217,20 +217,18 @@ def save_knowledge_store(payload: Dict[str, Any]) -> None:
 def call_ollama(model: str, prompt: str, temperature: float) -> str:
     payload = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "prompt": prompt,
         "stream": False,
         "options": {"temperature": temperature},
     }
 
     resp = requests.post(
-        "http://localhost:11434/api/chat",
+        OLLAMA_URL,
         json=payload,
         timeout=120,
     )
     resp.raise_for_status()
-    return resp.json()["message"]["content"]
+    return resp.json()["response"]
 
 
 # =========================
